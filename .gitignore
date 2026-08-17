@@ -7,6 +7,11 @@ coverage
 .env
 .env.local
 .env.*.local
+# Per-company credential files: .env.ek / .env.jm / .env.mrss and their backups.
+# Each holds a CLIENT SECRET and a REFRESH TOKEN. The bare `.env` rule above did
+# not cover them, so they sat untracked-but-stageable in the working tree.
+.env.*
+!.env.example
 tokens.json
 
 start.cmd

@@ -246,6 +246,35 @@ export class QuickbooksClient {
     return new Error(cause ? `${msg} (cause: ${cause})` : msg);
   }
 
+  /**
+   * The OAuth callback port, resolved from ONE source of truth.
+   *
+   * The redirect URI is configurable but the listener port was the literal 8000,
+   * so pointing QUICKBOOKS_REDIRECT_URI at another port produced a server on one
+   * port and an Intuit redirect aimed at another — a handshake that can never
+   * complete, with nothing in the logs to say why. Derive the port from the
+   * redirect URI whenever there is one so the two cannot drift.
+   *
+   * The port is not freely choosable: Intuit only redirects to URIs registered
+   * on the app, so changing it means registering the new one there first.
+   * ~/FamilyData/PORTS.md records what else on this machine holds a port.
+   */
+  private static resolveCallbackPort(): number {
+    const uri = process.env.QUICKBOOKS_REDIRECT_URI;
+    if (uri) {
+      try {
+        const parsed = new URL(uri);
+        if (parsed.port) return Number(parsed.port);
+        return parsed.protocol === 'https:' ? 443 : 80;
+      } catch {
+        // Unparseable URI — fall through rather than guessing a port.
+      }
+    }
+    const explicit = process.env.QUICKBOOKS_OAUTH_PORT;
+    if (explicit && Number.isInteger(Number(explicit))) return Number(explicit);
+    return 8000;
+  }
+
   private async startOAuthFlow(): Promise<void> {
     // The interactive flow below binds a localhost callback server, but Intuit
     // rejects localhost redirect URIs for production apps — so this can only
@@ -260,7 +289,7 @@ export class QuickbooksClient {
     }
 
     this.isAuthenticating = true;
-    const port = 8000;
+    const port = QuickbooksClient.resolveCallbackPort();
 
     // The local server below receives the callback, so the authorize/exchange
     // pair must use the localhost redirect even when QUICKBOOKS_REDIRECT_URI
@@ -275,6 +304,16 @@ export class QuickbooksClient {
     });
 
     return new Promise((resolve, reject) => {
+      // Watchdog state for the bind-to-callback window. `oauthSettled` makes the
+      // teardown idempotent so the timeout and a real callback cannot both fire.
+      const oauthTimeoutMs = Number(process.env.QUICKBOOKS_OAUTH_TIMEOUT_MS) || 180_000;
+      let oauthTimer: ReturnType<typeof setTimeout> | undefined;
+      let oauthSettled = false;
+      const clearOauthWatchdog = () => {
+        oauthSettled = true;
+        if (oauthTimer) clearTimeout(oauthTimer);
+      };
+
       // Guard against duplicate /callback requests for the same authorization
       // code. Browsers resolve `localhost` to both 127.0.0.1 and ::1, and the
       // server binds dual-stack (`::`), so the redirect frequently lands twice.
@@ -356,6 +395,7 @@ export class QuickbooksClient {
             `);
 
             // Close server after a short delay
+            clearOauthWatchdog();
             setTimeout(() => {
               server.close();
               this.isAuthenticating = false;
@@ -381,6 +421,7 @@ export class QuickbooksClient {
                 </body>
               </html>
             `);
+            clearOauthWatchdog();
             this.isAuthenticating = false;
             reject(error);
           }
@@ -390,6 +431,31 @@ export class QuickbooksClient {
       // Start server — bind to all interfaces (IPv4 + IPv6) so ngrok can reach it
       // regardless of whether it resolves `localhost` to 127.0.0.1 or ::1
       server.listen(port, '::', async () => {
+        // A handshake nobody completes must EXPIRE rather than wait forever.
+        // Without this the promise can never settle on an unattended machine:
+        // the listener stays bound, the caller hangs, and the port is held for
+        // the life of the process. That is exactly how port 8000 was held for
+        // three days on 2026-08-14. Upstream's production fail-fast above stops
+        // that for production apps; this covers sandbox, and covers any future
+        // path that reaches the interactive flow.
+        //
+        // Started only once the socket is actually bound, so a failed bind is
+        // not charged against the human's thinking time.
+        oauthTimer = setTimeout(() => {
+          if (oauthSettled) return;
+          oauthSettled = true;
+          try { server.close(); } catch { /* already closed */ }
+          this.isAuthenticating = false;
+          reject(new Error(
+            `QuickBooks OAuth timed out after ${Math.round(oauthTimeoutMs / 1000)}s waiting for ` +
+            `the callback on port ${port}; nobody completed the browser flow. The listener has ` +
+            `been closed and the port released, so this cannot block other companies. Retry ` +
+            `with a browser present, or raise QUICKBOOKS_OAUTH_TIMEOUT_MS.`,
+          ));
+        }, oauthTimeoutMs);
+        // A pending handshake must not, by itself, hold the process open.
+        oauthTimer.unref?.();
+
         const addr = server.address();
         console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
 
@@ -413,8 +479,27 @@ export class QuickbooksClient {
       });
 
       // Handle server errors
-      server.on('error', (error) => {
+      server.on('error', (error: NodeJS.ErrnoException) => {
         console.error('Server error:', error);
+        // A bare "listen EADDRINUSE :::8000" says nothing about the cause, and
+        // the cause is nearly always another company's server (several QuickBooks
+        // companies run this same binary) or an orphan from a handshake that was
+        // never completed. Name it, and give the command that finds the holder.
+        if (error.code === 'EADDRINUSE') {
+          clearOauthWatchdog();
+          this.isAuthenticating = false;
+          reject(new Error(
+            `QuickBooks OAuth callback port ${port} is already in use, so this handshake ` +
+            `cannot start.\n\n` +
+            `  Likely another QuickBooks company's server (they share this binary) is ` +
+            `mid-handshake, or an earlier one left an orphan holding the port.\n\n` +
+            `  Find it:  lsof -nP -iTCP:${port} -sTCP:LISTEN\n` +
+            `  Orphans:  pgrep -fl quickbooks-online-mcp-server\n\n` +
+            `Only one interactive handshake can run at a time.`,
+          ));
+          return;
+        }
+        clearOauthWatchdog();
         this.isAuthenticating = false;
         reject(error);
       });
