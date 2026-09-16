@@ -264,8 +264,20 @@ export class QuickbooksClient {
     if (uri) {
       try {
         const parsed = new URL(uri);
-        if (parsed.port) return Number(parsed.port);
-        return parsed.protocol === 'https:' ? 443 : 80;
+        // ⭐ ONLY A LOOPBACK REDIRECT MAY SET THE LISTENER'S PORT (16.09.2026, rebase onto
+        // upstream's interactive-OAuth work). The point of this resolver is that a LOCAL
+        // callback and its listener cannot drift apart. A REMOTE redirect URI — the usual
+        // production setting is Intuit's OAuth2Playground — describes where Intuit sends the
+        // browser, not where we can listen, and deriving a port from it produced
+        // `http://localhost:443/callback` for the local fallback: a listener we cannot bind
+        // and a callback that never arrives. Upstream's own test asserts the localhost
+        // redirect is used "even when QUICKBOOKS_REDIRECT_URI points elsewhere", and it is
+        // right. So: loopback host → honour its port; anything else → fall through.
+        const loopback = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]' || parsed.hostname === '::1';
+        if (loopback) {
+          if (parsed.port) return Number(parsed.port);
+          return parsed.protocol === 'https:' ? 443 : 80;
+        }
       } catch {
         // Unparseable URI — fall through rather than guessing a port.
       }
